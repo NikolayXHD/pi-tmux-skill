@@ -143,12 +143,15 @@ def notified_command(command, window):
     The wrapper sets the pane title, runs the command, saves the full
     scrollback into DUMP_DIR, notifies, then waits CLOSE_AFTER seconds in
     which a keystroke leaves an interactive shell instead of closing, and
-    closes the pane if nobody typed. Ctrl+C during the command leaves the
-    same shell and reports nothing: the person who pressed it is the one to
-    tell.
+    closes the pane if nobody typed. Ctrl+C during the command still gets the
+    dump and the notification (exit code 130 tells the story); afterwards the
+    pane is left with an interactive shell.
 
     Inside `bash -c` the command becomes a shell string, hence shlex.join:
-    naive joining would break any argument containing a space or a quote.
+    naive joining would break any argument containing a space or a quote. The
+    string is delegated to the pane's `$SHELL` (tmux sets it), so user shell
+    functions (`edit`, ...) are visible to the command; the wrapper itself
+    stays bash because it needs traps and counters.
     """
     inner = shlex.join(command)
     dump_dir = shlex.quote(os.path.expanduser(DUMP_DIR))
@@ -164,11 +167,8 @@ def notified_command(command, window):
             + ' >/dev/null 2>&1 || true'
         ),
         f'printf "%s\\n" {shlex.quote(inner)}',
-        inner,
+        f'"${{SHELL:-/bin/sh}}" -c {shlex.quote(inner)}',
         'rc=$?',
-        'if [ "$interrupted" -ne 0 ]; then',
-        '  exec "${SHELL:-/bin/sh}" -i',
-        'fi',
         f'mkdir -p {dump_dir}',
         'tmux capture-pane -p -t "$TMUX_PANE" -S - > "$dump_path" || true',
     ]
@@ -178,6 +178,9 @@ def notified_command(command, window):
         lines.append('place="панель $TMUX_PANE, окно $window"')
         lines.append(_notify_line(target, inner))
     lines += [
+        'if [ "$interrupted" -ne 0 ]; then',
+        '  exec "${SHELL:-/bin/sh}" -i',
+        'fi',
         f'seconds={CLOSE_AFTER}',
         'cancelled=0',
         'while [ "$seconds" -gt 0 ]; do',

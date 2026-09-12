@@ -3,8 +3,10 @@
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -274,12 +276,15 @@ def test_when_wrapped_then_trap_set_before_command():
     script = script_of(command=('sleep', '5'))
     lines = script.splitlines()
     trap = next(i for i, line in enumerate(lines) if line.startswith('trap '))
-    assert trap < lines.index('sleep 5')
+    command = next(i for i, line in enumerate(lines) if "-c 'sleep 5'" in line)
+    assert trap < command
     assert "trap '' INT" not in script
 
 
-def test_when_wrapped_then_interrupt_leaves_shell_before_dump():
-    """Ctrl+C: панель остаётся с шеллом, дампа и уведомления нет."""
+def test_when_wrapped_then_interrupt_leaves_shell_after_dump_and_notify(
+    pi_session
+):
+    """Ctrl+C: дамп и уведомление уходят, потом панель остаётся с шеллом."""
     script = script_of()
     lines = script.splitlines()
     guard = next(
@@ -287,10 +292,12 @@ def test_when_wrapped_then_interrupt_leaves_shell_before_dump():
         for i, line in enumerate(lines)
         if line.startswith('if [ "$interrupted"')
     )
-    assert lines[guard + 1] == '  exec "${SHELL:-/bin/sh}" -i'
-    assert guard < lines.index(
+    dump = lines.index(
         'tmux capture-pane -p -t "$TMUX_PANE" -S - > "$dump_path" || true'
     )
+    notify = next(i for i, line in enumerate(lines) if t.NOTIFIER in line)
+    assert dump < notify < guard
+    assert lines[guard + 1] == '  exec "${SHELL:-/bin/sh}" -i'
 
 
 def test_when_wrapped_then_dump_notify_countdown_in_order(pi_session):
@@ -408,6 +415,80 @@ def test_when_command_has_special_args_then_pane_shell_keeps_argv(
 
 def test_when_wrapped_then_exit_code_preserved():
     assert script_of(command=('false',)).splitlines()[-1] == 'exit "$rc"'
+
+
+def test_when_interrupted_then_dump_and_notify_run_before_shell(
+    monkeypatch, tmp_path, pi_session
+):
+    """Ctrl+C по группе процессов: дамп и уведомление уходят, потом шелл."""
+    monkeypatch.setattr(t, 'DUMP_DIR', str(tmp_path / 'dumps'))
+    script = script_of(command=('sleep', '30'))
+    stub_dir = tmp_path / 'bin'
+    stub_dir.mkdir()
+    tmux_stub = stub_dir / 'tmux'
+    tmux_stub.write_text('#!/bin/sh\nexit 0\n')
+    tmux_stub.chmod(0o755)
+    env = {
+        **os.environ,
+        'TMUX_PANE': '%99',
+        'SHELL': '/bin/sh',
+        'PI_CODING_AGENT_DIR': str(tmp_path),
+        'PATH': f'{stub_dir}:{os.environ["PATH"]}',
+    }
+    proc = subprocess.Popen(
+        ['bash', '-c', script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd=tmp_path,
+        start_new_session=True,
+    )
+    time.sleep(1.0)
+    os.killpg(proc.pid, signal.SIGINT)
+    proc.wait(timeout=30)
+    out = proc.stdout.read().decode()
+    assert (tmp_path / 'dumps' / '%99.log').exists()
+    assert 'уведомление не отправлено' in out
+
+
+def test_when_command_is_user_shell_function_then_user_shell_runs_it(
+    monkeypatch, tmp_path
+):
+    """Команда исполняется в $SHELL: функции шелла пользователя доступны."""
+    user_shell = tmp_path / 'user_shell.sh'
+    user_shell.write_text(
+        '#!/bin/sh\n'
+        'if [ "$1" = "-c" ]; then\n'
+        '  eval "user_fn() { echo user-fn-ran; }; $2"\n'
+        'fi\n'
+    )
+    user_shell.chmod(0o755)
+    monkeypatch.setattr(t, 'DUMP_DIR', str(tmp_path / 'dumps'))
+    script = script_of(command=('user_fn',))
+    stub_dir = tmp_path / 'bin'
+    stub_dir.mkdir()
+    tmux_stub = stub_dir / 'tmux'
+    tmux_stub.write_text('#!/bin/sh\nexit 0\n')
+    tmux_stub.chmod(0o755)
+    env = {
+        **os.environ,
+        'TMUX_PANE': '%99',
+        'SHELL': str(user_shell),
+        'PATH': f'{stub_dir}:{os.environ["PATH"]}',
+    }
+    env.pop(t.PI_SESSION_ENV, None)
+    result = subprocess.run(
+        ['bash', '-c', script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd=tmp_path,
+        timeout=60,
+        check=True,
+    )
+    assert 'user-fn-ran' in result.stdout.decode()
 
 
 def test_when_wrapped_then_no_pi_variables_inside():
