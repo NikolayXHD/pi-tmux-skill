@@ -7,18 +7,16 @@ See SKILL.md (same directory) -- the skill this script implements.
 Usage: tmux.py [<subcommand>] [flags] [--] <command...>
 
 The pane is taken from TMUX_PANE: the script works in the pane it was called
-from and never creates a window or a session. Writes (splitting off a pane,
-close-pane) touch only that pane's window; reads (status, dump-screen) cover
-its session.
+from and never creates a window or a session. A new pane is split off in the
+calling window; reads (status, dump-screen) cover the whole session.
 
 Subcommands:
   status                  Windows and pane map of the session
-  close-pane  -p <id>     Close a pane (only in the calling pane's window)
   dump-screen -p <id>     Print pane contents (any window of the session)
 
 Flags:
   -d, --cwd <dir>   working directory
-  -p, --pane <id>   pane ID (close-pane, dump-screen)
+  -p, --pane <id>   pane ID (dump-screen)
 
 When the command finishes, the pane saves its scrollback to
 /tmp/tmux-panes-<uid>/<pane id>.log, wakes the pi session with a message,
@@ -40,7 +38,6 @@ after `--` or the first command word everything belongs to the command.
 Examples:
   tmux.py -- ./long_task.sh       # run in a pane of the calling window
   tmux.py status                  # windows and panes
-  tmux.py close-pane -p %56       # close pane
 """
 
 import os
@@ -55,7 +52,7 @@ CLOSE_AFTER = 15
 # Подмену каталога в общем /tmp чужим пользователем не отсекаем — риск
 # принят осознанно.
 DUMP_DIR = os.path.join('/tmp', f'tmux-panes-{os.getuid()}')
-ACTIONS = {'status', 'close-pane', 'dump-screen'}
+ACTIONS = {'status', 'dump-screen'}
 FLAGS = {'-d': 'cwd', '--cwd': 'cwd', '-p': 'pane', '--pane': 'pane'}
 # Идентификатор сессии pi, которой адресуется сообщение о завершении команды.
 # Процесс панели порождает сервер tmux и окружения агента не наследует,
@@ -360,11 +357,6 @@ def print_status(pane):
     print(tmux('list-panes', '-s', '-F', PANE_LINE_FORMAT, target=pane))
 
 
-def window_panes(caller):
-    """Panes of the window holding the calling pane."""
-    return tmux('list-panes', '-F', '#{pane_id}', target=caller).split()
-
-
 def session_panes(caller):
     """Panes of the session holding the calling pane, any window."""
     return tmux('list-panes', '-s', '-F', '#{pane_id}', target=caller).split()
@@ -375,17 +367,6 @@ def _pane_from_flag(opts, action):
     pane = opts['pane']
     if not pane:
         print(f'ERROR: -p/--pane required for {action}', file=sys.stderr)
-        sys.exit(1)
-    return pane
-
-
-def _pane_in_window(caller, opts):
-    """Pane id from -p, validated to belong to the calling pane's window."""
-    pane = _pane_from_flag(opts, 'close-pane')
-    if pane not in window_panes(caller):
-        print(
-            f'ERROR: pane {pane} is NOT in the calling window', file=sys.stderr
-        )
         sys.exit(1)
     return pane
 
@@ -422,8 +403,6 @@ def main():
             run_command(pane, command, cwd=opts['cwd'])
         elif action == 'status':
             print_status(pane)
-        elif action == 'close-pane':
-            tmux('kill-pane', target=_pane_in_window(pane, opts))
         elif action == 'dump-screen':
             print(
                 tmux(

@@ -83,7 +83,6 @@ def opts(**kw):
             (opts(), None, ['watch', '-n', '1', 'date']),
         ),
         (['status'], (opts(), 'status', None)),
-        (['close-pane', '-p', '%56'], (opts(pane='%56'), 'close-pane', None)),
         (
             ['dump-screen', '-p', '%56'],
             (opts(pane='%56'), 'dump-screen', None),
@@ -110,10 +109,10 @@ def test_when_argv_parsed_then_args_result(argv, expected):
         ['-d'],
         ['-d', '/tmp'],
         ['-p', '%1'],
-        ['close-pane', 'status'],
-        ['close-pane', '-p'],
+        ['dump-screen', 'status'],
+        ['dump-screen', '-p'],
         ['status', '--'],
-        ['close-pane', '-p', 'x', '--'],
+        ['dump-screen', '-p', 'x', '--'],
         ['--close-after', '5', '--', 'x'],
     ],
 )
@@ -722,51 +721,24 @@ def run_main(argv, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    'argv,command,expected_args',
+    'pane,panes',
     [
-        (['close-pane', '-p', '%58'], 'kill-pane', ()),
-        (['dump-screen', '-p', '%58'], 'capture-pane', ('-p', '-S', '-')),
+        ('%58', '%52 %58'),
+        ('%57', '%52 %57'),
     ],
 )
-def test_when_action_pane_in_window_then_tmux_called(
-    monkeypatch, capsys, argv, command, expected_args
+def test_when_dump_screen_pane_in_session_then_tmux_called(
+    monkeypatch, capsys, pane, panes
 ):
-    run_main(argv, monkeypatch)
+    """dump-screen read-only: панель любого окна сессии дампится по target."""
+    run_main(['dump-screen', '-p', pane], monkeypatch)
     calls = []
-    fake = record_tmux(calls, {'#{pane_id}': '%52 %58'})
+    fake = record_tmux(calls, {'#{pane_id}': panes, 'capture-pane': 'output'})
     monkeypatch.setattr(t, 'tmux', fake)
     t.main()
-    assert (command, '%58', expected_args) in calls
+    assert ('capture-pane', pane, ('-p', '-S', '-')) in calls
     assert calls_without_target(calls) == []
-
-
-def test_when_dump_screen_pane_in_other_window_then_tmux_called(
-    monkeypatch, capsys
-):
-    """dump-screen read-only: панели других окон сессии дампить можно."""
-    run_main(['dump-screen', '-p', '%57'], monkeypatch)
-    calls = []
-    fake = record_tmux(
-        calls, {'#{pane_id}': '%52 %57', 'capture-pane': 'output'}
-    )
-    monkeypatch.setattr(t, 'tmux', fake)
-    t.main()
-    assert ('capture-pane', '%57', ('-p', '-S', '-')) in calls
     assert 'output' in capsys.readouterr().out
-
-
-def test_when_close_pane_in_other_window_then_error_and_no_tmux(
-    monkeypatch, capsys
-):
-    run_main(['close-pane', '-p', '%57'], monkeypatch)
-    calls = []
-    fake = record_tmux(calls, {'#{pane_id}': '%52 %58'})
-    monkeypatch.setattr(t, 'tmux', fake)
-    with pytest.raises(SystemExit) as exc:
-        t.main()
-    assert exc.value.code == 1
-    assert 'pane %57 is NOT in the calling window' in capsys.readouterr().err
-    assert [call[0] for call in calls] == ['list-panes']
 
 
 def test_when_dump_pane_not_in_session_then_error_and_no_tmux(
@@ -783,15 +755,8 @@ def test_when_dump_pane_not_in_session_then_error_and_no_tmux(
     assert [call[0] for call in calls] == ['list-panes']
 
 
-@pytest.mark.parametrize(
-    'argv',
-    [
-        ['close-pane'],
-        ['dump-screen'],
-    ],
-)
-def test_when_pane_flag_missing_then_error(monkeypatch, capsys, argv):
-    run_main(argv, monkeypatch)
+def test_when_pane_flag_missing_then_error(monkeypatch, capsys):
+    run_main(['dump-screen'], monkeypatch)
     with pytest.raises(SystemExit) as exc:
         t.main()
     assert exc.value.code == 1
