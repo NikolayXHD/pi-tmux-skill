@@ -1,4 +1,4 @@
-"""Тесты формирования текста уведомления (intercom_send.py скила tmux)."""
+"""Тесты финального уведомления (intercom_send.py скила tmux)."""
 
 import sys
 from argparse import Namespace
@@ -20,22 +20,6 @@ def notification(**kw):
         'dump': None,
     }
     return Namespace(**{**defaults, **kw})
-
-
-@pytest.mark.parametrize(
-    'seconds,expected',
-    [
-        (0, '0 с'),
-        (59, '59 с'),
-        (60, '1 мин 0 с'),
-        (92, '1 мин 32 с'),
-        (3599, '59 мин 59 с'),
-        (3600, '1 ч 0 мин'),
-        (5430, '1 ч 30 мин'),
-    ],
-)
-def test_when_duration_formatted_then_units_match_scale(seconds, expected):
-    assert s._format_duration(seconds) == expected
 
 
 def test_when_place_given_then_message_starts_with_it():
@@ -65,12 +49,37 @@ def test_when_elapsed_given_then_duration_included():
 
 def test_when_command_given_then_quoted_on_own_line():
     text = s._compose_text(notification(command='cmake --build build -j 5'))
-    assert text.splitlines()[-1] == '`cmake --build build -j 5`'
+    assert '`cmake --build build -j 5`' in text.splitlines()
 
 
-def test_when_dump_given_then_path_mentioned():
-    text = s._compose_text(notification(dump='/tmp/out.log'))
-    assert text.splitlines()[-1] == 'Вывод сохранён: `/tmp/out.log`'
+def test_when_dump_short_then_block_and_path_included(tmp_path):
+    dump = tmp_path / 'out.log'
+    dump.write_text('alpha\nbeta', encoding='utf-8')
+    lines = s._compose_text(notification(dump=str(dump))).splitlines()
+    assert 'alpha' in lines
+    assert 'beta' in lines
+    assert f'Вывод сохранён: `{dump}`' in lines
+    assert not any(line.startswith('Показаны строки') for line in lines)
+
+
+def test_when_dump_truncated_then_hint_names_lines(tmp_path):
+    dump = tmp_path / 'out.log'
+    dump.write_text('\n'.join(['a' * 20] * 30), encoding='utf-8')
+    lines = s._compose_text(notification(dump=str(dump))).splitlines()
+    assert (
+        'Показаны строки 1–11 и 20–30 из 30:'
+        f" `sed -n '1,11p;20,30p' {dump}`"
+    ) in lines
+    assert f'Вывод сохранён: `{dump}`' in lines
+
+
+def test_when_dump_missing_then_honest_line_without_block(tmp_path):
+    dump = tmp_path / 'absent.log'
+    text = s._compose_text(notification(command='make', dump=str(dump)))
+    lines = text.splitlines()
+    assert f'Вывод не удалось прочитать: `{dump}`' in lines
+    assert 'Вывод сохранён' not in text
+    assert lines[-1] == f'Вывод не удалось прочитать: `{dump}`'
 
 
 @pytest.mark.parametrize(

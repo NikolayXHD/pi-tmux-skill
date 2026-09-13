@@ -258,6 +258,10 @@ def test_when_run_command_then_split_next_to_calling_pane(
     'fragment',
     [
         'capture-pane -p -t "$TMUX_PANE" -S -',
+        'mkdir -p -m 700 "$dump_dir"',
+        'dump_path="$dump_dir/$TMUX_PANE.log"',
+        'dump_tmp="$dump_path.tmp"',
+        'mv -f "$dump_tmp" "$dump_path" || rm -f "$dump_tmp"',
         'закрою через',
         f'seconds={t.CLOSE_AFTER}',
         'tmux kill-pane -t "$TMUX_PANE"',
@@ -270,6 +274,27 @@ def test_when_wrapped_then_dump_countdown_and_close_embedded(fragment):
 
 def test_when_wrapped_then_first_line_guards_pane_id():
     assert script_of().splitlines()[0] == ': "${TMUX_PANE:?}"'
+
+
+def test_when_wrapped_then_countdown_keys_close_or_keep():
+    """Esc оставляет панель; Ctrl+C/Ctrl+D и таймаут закрывают, прочие игнор."""
+    lines = [line.strip() for line in script_of().splitlines()]
+    assert "esc=$(printf '\\033')" in lines
+    assert "intr=$(printf '\\003')" in lines
+    assert "del=$(printf '\\004')" in lines
+    assert 'if [ "$interrupted" -ne 0 ]; then break; fi' in lines
+    assert '"$esc") keep=1; break ;;' in lines
+    assert '"$intr"|"$del") break ;;' in lines
+    assert 'elif [ "$status" -le 128 ]; then' in lines
+    close = lines.index(
+        'tmux kill-pane -t "$TMUX_PANE" >/dev/null 2>&1 || true'
+    )
+    assert lines[close - 1] == 'if [ "$keep" -eq 0 ]; then'
+
+
+def test_when_dump_dir_then_per_user_under_tmp():
+    """Дампы временные: каталог под uid, чтобы общий /tmp был только наш."""
+    assert t.DUMP_DIR == f'/tmp/tmux-panes-{os.getuid()}'
 
 
 def test_when_wrapped_then_trap_set_before_command():
@@ -292,9 +317,7 @@ def test_when_wrapped_then_interrupt_leaves_shell_after_dump_and_notify(
         for i, line in enumerate(lines)
         if line.startswith('if [ "$interrupted"')
     )
-    dump = lines.index(
-        'tmux capture-pane -p -t "$TMUX_PANE" -S - > "$dump_path" || true'
-    )
+    dump = next(i for i, line in enumerate(lines) if 'capture-pane' in line)
     notify = next(i for i, line in enumerate(lines) if t.NOTIFIER in line)
     assert dump < notify < guard
     assert lines[guard + 1] == '  exec "${SHELL:-/bin/sh}" -i'
@@ -312,10 +335,69 @@ def test_when_wrapped_then_dump_notify_countdown_in_order(pi_session):
     assert dump < notify < countdown < kill
 
 
+def test_when_pi_session_then_progress_notifier_launched_before_command(
+    pi_session,
+):
+    """Нотификатор стартует после trap и mkdir, до команды, и гасится до дампа."""
+    lines = script_of(command=('make', '-j8')).splitlines()
+    trap = next(i for i, line in enumerate(lines) if line.startswith('trap '))
+    mkdir = next(
+        i for i, line in enumerate(lines) if line.startswith('mkdir -p')
+    )
+    launch = next(
+        i for i, line in enumerate(lines) if t.PROGRESS_NOTIFIER in line
+    )
+    command = next(
+        i for i, line in enumerate(lines) if "-c 'make -j8'" in line
+    )
+    kill = next(
+        i
+        for i, line in enumerate(lines)
+        if line.strip().startswith('kill "$notifier_pid"')
+    )
+    dump = next(i for i, line in enumerate(lines) if 'capture-pane' in line)
+    assert trap < mkdir < launch < command < kill < dump
+
+
+def test_when_pi_session_then_progress_notifier_gets_session_and_place(
+    pi_session,
+):
+    line = next(
+        line
+        for line in script_of().splitlines()
+        if t.PROGRESS_NOTIFIER in line
+    )
+    assert f'--to {pi_session}' in line
+    assert '--place "$place"' in line
+    assert '>/dev/null 2>"$dump_dir/$TMUX_PANE.notifier.log"' in line
+    assert line.endswith('& notifier_pid=$!')
+
+
+def test_when_pi_session_then_notifier_killed_when_running_and_reaped(
+    pi_session,
+):
+    """Kill под защитой состояния задачи: PID переиспользуется после её выхода."""
+    lines = script_of().splitlines()
+    guard = lines.index('if [ "$(jobs -rp)" = "$notifier_pid" ]; then')
+    assert lines[guard + 1] == '  kill "$notifier_pid" 2>/dev/null || true'
+    assert lines[guard + 2] == 'fi'
+    assert lines[guard + 3] == 'wait "$notifier_pid" 2>/dev/null || true'
+
+
+def test_when_wrapped_then_stale_dump_removed_before_capture():
+    """Дамп прошлого запуска не выдаётся за финальный вывод этого."""
+    lines = script_of().splitlines()
+    remove = lines.index('rm -f "$dump_path"')
+    dump = next(i for i, line in enumerate(lines) if 'capture-pane' in line)
+    assert remove < dump
+
+
 def test_when_no_pi_session_then_dump_and_countdown_kept():
     """Без адресата панель всё равно переживает команду и сохраняет вывод."""
     script = script_of()
     assert t.NOTIFIER not in script
+    assert t.PROGRESS_NOTIFIER not in script
+    assert 'notifier_pid' not in script
     assert 'capture-pane' in script
     assert 'kill-pane' in script
 
@@ -417,6 +499,22 @@ def test_when_wrapped_then_exit_code_preserved():
     assert script_of(command=('false',)).splitlines()[-1] == 'exit "$rc"'
 
 
+def notifier_pids(pane):
+    """PIDs живых нотификаторов панели (по /proc: скрипт и номер панели)."""
+    pids = []
+    for entry in Path('/proc').glob('[0-9]*/cmdline'):
+        try:
+            cmdline = entry.read_bytes().decode(errors='replace')
+        except OSError:
+            continue
+        if 'progress_notify.py' in cmdline and pane in cmdline:
+            pids.append(entry.parent.name)
+    return pids
+
+
+@pytest.mark.skipif(
+    not Path('/proc').is_dir(), reason='нужен /proc для поиска процессов'
+)
 def test_when_interrupted_then_dump_and_notify_run_before_shell(
     monkeypatch, tmp_path, pi_session
 ):
@@ -448,8 +546,130 @@ def test_when_interrupted_then_dump_and_notify_run_before_shell(
     os.killpg(proc.pid, signal.SIGINT)
     proc.wait(timeout=30)
     out = proc.stdout.read().decode()
+    deadline = time.monotonic() + 5
+    while notifier_pids('%99') and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert notifier_pids('%99') == []
     assert (tmp_path / 'dumps' / '%99.log').exists()
     assert 'уведомление не отправлено' in out
+
+
+def countdown_stubs(tmp_path):
+    """Стабы панели: tmux пишет вызовы, шелл помечает интерактивный запуск."""
+    calls = tmp_path / 'tmux-calls'
+    marker = tmp_path / 'shell-started'
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    tmux_stub = bin_dir / 'tmux'
+    tmux_stub.write_text(f'#!/bin/sh\necho "$@" >> "{calls}"\nexit 0\n')
+    tmux_stub.chmod(0o755)
+    shell_stub = tmp_path / 'shell.sh'
+    shell_stub.write_text(
+        '#!/bin/sh\n'
+        f'if [ "$1" = "-i" ]; then echo interactive > "{marker}"; fi\n'
+        'exit 0\n'
+    )
+    shell_stub.chmod(0o755)
+    return calls, marker, bin_dir, shell_stub
+
+
+def start_countdown(monkeypatch, tmp_path):
+    """Запустить обёртку с быстрой командой и вернуть процесс и стабы."""
+    monkeypatch.setattr(t, 'DUMP_DIR', str(tmp_path / 'dumps'))
+    calls, marker, bin_dir, shell_stub = countdown_stubs(tmp_path)
+    env = {
+        **os.environ,
+        'TMUX_PANE': '%99',
+        'SHELL': str(shell_stub),
+        'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+    }
+    proc = subprocess.Popen(
+        ['bash', '-c', script_of(command=('true',))],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        cwd=tmp_path,
+        start_new_session=True,
+    )
+    return proc, calls, marker
+
+
+@pytest.mark.parametrize(
+    'keys,expect_shell,min_seconds',
+    [
+        (b'\x1b', True, 0),
+        (b'\x1b[A', True, 0),
+        (b'\x03', False, 0),
+        (b'\x04', False, 0),
+        (b'x', False, 1),
+        (None, False, 0),
+    ],
+    ids=[
+        'esc-keeps',
+        'arrow-keeps',
+        'ctrl-c-closes',
+        'ctrl-d-closes',
+        'other-key-ignored',
+        'eof-closes',
+    ],
+)
+def test_when_countdown_key_then_pane_kept_or_closed(
+    monkeypatch, tmp_path, keys, expect_shell, min_seconds
+):
+    """Esc и его префикс (стрелки) оставляют шелл; Ctrl+C/Ctrl+D закрывают."""
+    monkeypatch.setattr(t, 'CLOSE_AFTER', 3)
+    proc, calls, marker = start_countdown(monkeypatch, tmp_path)
+    started = time.monotonic()
+    if keys is None:
+        proc.stdin.close()
+    else:
+        proc.stdin.write(keys)
+        proc.stdin.flush()
+    try:
+        proc.wait(timeout=30)
+    finally:
+        proc.kill()
+    elapsed = time.monotonic() - started
+    if keys is not None:
+        proc.stdin.close()
+    logged = calls.read_text() if calls.exists() else ''
+    assert ('kill-pane' in logged) is not expect_shell
+    assert marker.exists() is expect_shell
+    assert elapsed >= min_seconds
+
+
+def test_when_countdown_interrupted_then_pane_closes(monkeypatch, tmp_path):
+    """Ctrl+C в отсчёте: панель закрывается сразу, шелл не остаётся."""
+    monkeypatch.setattr(t, 'CLOSE_AFTER', 30)
+    proc, calls, marker = start_countdown(monkeypatch, tmp_path)
+    time.sleep(1.0)
+    os.killpg(proc.pid, signal.SIGINT)
+    try:
+        proc.wait(timeout=30)
+    finally:
+        proc.stdin.close()
+        proc.kill()
+    assert 'kill-pane' in calls.read_text()
+    assert not marker.exists()
+
+
+def test_when_notifier_running_at_command_end_then_killed(
+    monkeypatch, tmp_path, pi_session
+):
+    """С адресатом нотификатор гасится по состоянию задачи: процессов не остаётся."""
+    monkeypatch.setattr(t, 'CLOSE_AFTER', 1)
+    proc, calls, marker = start_countdown(monkeypatch, tmp_path)
+    try:
+        proc.stdin.close()
+        proc.wait(timeout=30)
+    finally:
+        proc.kill()
+    deadline = time.monotonic() + 5
+    while notifier_pids('%99') and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert notifier_pids('%99') == []
+    assert 'kill-pane' in calls.read_text()
 
 
 def test_when_command_is_user_shell_function_then_user_shell_runs_it(

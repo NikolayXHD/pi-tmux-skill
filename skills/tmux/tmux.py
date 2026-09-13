@@ -21,11 +21,18 @@ Flags:
   -p, --pane <id>   pane ID (close-pane, dump-screen)
 
 When the command finishes, the pane saves its scrollback to
-~/.cache/tmux-panes/<pane id>.log, wakes the pi session with a message, shows
-a 15 second countdown and closes itself; a keystroke inside the countdown
-cancels the closing and leaves an interactive shell. Ctrl+C during the command
-leaves the same shell: nothing is reported about it, the person who pressed it
-is the one to tell.
+/tmp/tmux-panes-<uid>/<pane id>.log, wakes the pi session with a message,
+shows a 15 second countdown and closes itself. Inside the countdown Esc
+cancels the closing and leaves an interactive shell (an arrow or Alt key
+starts with it, so it keeps the pane too), Ctrl+C or Ctrl+D close the pane
+at once, other keys are ignored. Ctrl+C during the command leaves the same
+shell: nothing is reported about it, the person who pressed it is the one
+to tell.
+
+While the command runs and the pi session is addressed, a progress notifier
+(progress_notify.py) runs in the background: it overwrites the same dump file
+atomically and reports truncated snapshots to the session. The dump is
+replaced atomically, so a reader never sees a half-written file.
 
 Flags are parsed only before the command (or after a subcommand name);
 after `--` or the first command word everything belongs to the command.
@@ -42,18 +49,21 @@ import subprocess
 import sys
 
 # Сколько секунд панель ждёт после завершения команды перед закрытием.
-# Нажатие клавиши отменяет закрытие, поэтому настраивать задержку не нужно.
+# Закрытие отменяет только Esc, поэтому настраивать задержку не нужно.
 CLOSE_AFTER = 15
-DUMP_DIR = '~/.cache/tmux-panes'
+# Дампы временные: каталог под uid, как /tmp/tmux-<uid> у самого tmux.
+# Подмену каталога в общем /tmp чужим пользователем не отсекаем — риск
+# принят осознанно.
+DUMP_DIR = os.path.join('/tmp', f'tmux-panes-{os.getuid()}')
 ACTIONS = {'status', 'close-pane', 'dump-screen'}
 FLAGS = {'-d': 'cwd', '--cwd': 'cwd', '-p': 'pane', '--pane': 'pane'}
 # Идентификатор сессии pi, которой адресуется сообщение о завершении команды.
 # Процесс панели порождает сервер tmux и окружения агента не наследует,
 # поэтому адрес вписывается в саму команду при запуске.
 PI_SESSION_ENV = 'PI_INTERCOM_SESSION_ID'
-NOTIFIER = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), 'intercom_send.py'
-)
+SKILL_DIR = os.path.dirname(os.path.realpath(__file__))
+NOTIFIER = os.path.join(SKILL_DIR, 'intercom_send.py')
+PROGRESS_NOTIFIER = os.path.join(SKILL_DIR, 'progress_notify.py')
 # Строки status рендерит tmux: разбора имён обратно в Python нет.
 WINDOW_LINE_FORMAT = (
     '  #{window_id} #{window_index}: #{window_name}'
@@ -142,10 +152,18 @@ def notified_command(command, window):
 
     The wrapper sets the pane title, runs the command, saves the full
     scrollback into DUMP_DIR, notifies, then waits CLOSE_AFTER seconds in
-    which a keystroke leaves an interactive shell instead of closing, and
-    closes the pane if nobody typed. Ctrl+C during the command still gets the
+    which Esc (or an arrow or Alt key starting with it) leaves an interactive
+    shell instead of closing, while Ctrl+C, Ctrl+D and the timeout close the
+    pane; other keys are ignored. Ctrl+C during the command still gets the
     dump and the notification (exit code 130 tells the story); afterwards the
     pane is left with an interactive shell.
+
+    With an addressee the wrapper also starts progress_notify.py before the
+    command and kills it right after: the kill is guarded by the shell's job
+    state, because a notifier that outlived its last deadline is reaped and
+    its pid could belong to another process by then. Its stdout goes to
+    /dev/null and stderr to a log in the dump directory, so nothing of the
+    notifier itself lands in the pane scrollback.
 
     Inside `bash -c` the command becomes a shell string, hence shlex.join:
     naive joining would break any argument containing a space or a quote. The
@@ -155,42 +173,73 @@ def notified_command(command, window):
     """
     inner = shlex.join(command)
     dump_dir = shlex.quote(os.path.expanduser(DUMP_DIR))
+    target = os.environ.get(PI_SESSION_ENV)
     lines = [
         ': "${TMUX_PANE:?}"',
         't0=$SECONDS',
         'interrupted=0',
         "trap 'interrupted=1' INT",
-        'dump_path=' + dump_dir + '/$TMUX_PANE.log',
+        f'dump_dir={dump_dir}',
+        'dump_path="$dump_dir/$TMUX_PANE.log"',
+        'mkdir -p -m 700 "$dump_dir"',
         (
             'tmux select-pane -t "$TMUX_PANE" -T '
             + shlex.quote(_pane_title(inner))
             + ' >/dev/null 2>&1 || true'
         ),
         f'printf "%s\\n" {shlex.quote(inner)}',
+    ]
+    if target:
+        lines += [
+            f'window={shlex.quote(window)}',
+            'place="панель $TMUX_PANE, окно $window"',
+            _progress_line(target, inner),
+        ]
+    lines += [
         f'"${{SHELL:-/bin/sh}}" -c {shlex.quote(inner)}',
         'rc=$?',
-        f'mkdir -p {dump_dir}',
-        'tmux capture-pane -p -t "$TMUX_PANE" -S - > "$dump_path" || true',
     ]
-    target = os.environ.get(PI_SESSION_ENV)
     if target:
-        lines.append(f'window={shlex.quote(window)}')
-        lines.append('place="панель $TMUX_PANE, окно $window"')
+        lines += [
+            'if [ "$(jobs -rp)" = "$notifier_pid" ]; then',
+            '  kill "$notifier_pid" 2>/dev/null || true',
+            'fi',
+            'wait "$notifier_pid" 2>/dev/null || true',
+        ]
+    lines += [
+        'rm -f "$dump_path"',
+        'dump_tmp="$dump_path.tmp"',
+        'tmux capture-pane -p -t "$TMUX_PANE" -S - > "$dump_tmp"'
+        ' && mv -f "$dump_tmp" "$dump_path" || rm -f "$dump_tmp"',
+    ]
+    if target:
         lines.append(_notify_line(target, inner))
     lines += [
         'if [ "$interrupted" -ne 0 ]; then',
         '  exec "${SHELL:-/bin/sh}" -i',
         'fi',
         f'seconds={CLOSE_AFTER}',
-        'cancelled=0',
+        'keep=0',
+        "esc=$(printf '\\033')",
+        "intr=$(printf '\\003')",
+        "del=$(printf '\\004')",
         'while [ "$seconds" -gt 0 ]; do',
-        '  printf "\\rзакрою через %3d с, нажатие клавиши отменяет  " "$seconds"',
-        '  if read -r -t 1 -n 1 _; then cancelled=1; break; fi',
-        '  if [ "$interrupted" -ne 0 ]; then cancelled=1; break; fi',
+        '  printf "\\rзакрою через %3d с, Esc оставит панель  " "$seconds"',
+        '  read -r -s -t 1 -n 1 key',
+        '  status=$?',
+        '  if [ "$interrupted" -ne 0 ]; then break; fi',
+        '  if [ "$status" -eq 0 ]; then',
+        '    case "$key" in',
+        '      "$esc") keep=1; break ;;',
+        '      "$intr"|"$del") break ;;',
+        '    esac',
+        '  elif [ "$status" -le 128 ]; then',
+        '    break',
+        '  fi',
         '  seconds=$((seconds-1))',
         'done',
         'echo',
-        'if [ "$cancelled" -eq 0 ]; then',
+        'if [ "$keep" -eq 0 ]; then',
         '  tmux kill-pane -t "$TMUX_PANE" >/dev/null 2>&1 || true',
         'else',
         '  exec "${SHELL:-/bin/sh}" -i',
@@ -217,6 +266,30 @@ def _notify_line(target, inner):
     return (
         head + ' --place "$place" --code "$rc"'
         ' --elapsed "$((SECONDS-t0))" --dump "$dump_path"'
+    )
+
+
+def _progress_line(target, inner):
+    """Shell command that starts the progress notifier in the background.
+
+    Progress messages are a bonus: unexpected exceptions must not land in the
+    pane scrollback, so stdout goes to /dev/null and stderr to a log in the
+    dump directory. The place is an expansion, as in _notify_line.
+    """
+    head = shlex.join(
+        [
+            sys.executable,
+            PROGRESS_NOTIFIER,
+            '--to',
+            target,
+            '--command',
+            inner,
+        ]
+    )
+    return (
+        head + ' --place "$place"'
+        ' >/dev/null 2>"$dump_dir/$TMUX_PANE.notifier.log"'
+        ' & notifier_pid=$!'
     )
 
 

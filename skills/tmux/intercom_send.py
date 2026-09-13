@@ -1,42 +1,29 @@
 #!/usr/bin/env python3
 """Сообщает сессии pi о завершении команды, запущенной в панели tmux.
 
-Протокол брокера pi-intercom: кадр — 4 байта длины и JSON, сначала
-регистрация отправителя, затем само сообщение.
-
 Вызывается обёрткой tmux.py изнутри панели, после того как команда
-закончилась. Доставка идёт через брокер pi-intercom: сессия получает
+закончилась: несёт исход, время, команду и урезанный финальный вывод.
+Доставка идёт через брокер pi-intercom (intercom.py); сессия получает
 сообщение и ход, поэтому агенту не нужно опрашивать панель.
 
-Отказ доставки печатается одной строкой и не влияет на панель.
+See SKILL.md (same directory) -- the skill these scripts implement.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import os
-import socket
-import struct
 import sys
-import time
-import uuid
 
-AGENT_DIR = os.environ.get('PI_CODING_AGENT_DIR') or os.path.expanduser('~/.pi/agent')
-SOCKET_PATH = os.path.join(AGENT_DIR, 'intercom', 'broker.sock')
-CONNECT_TIMEOUT = 5.0
-REPLY_TIMEOUT = 5.0
+from intercom import IntercomError, send
+from output import format_duration, hint, truncate
 
 
 def main() -> int:
     args = _parse_args()
     try:
-        reply = _send(args.to, _compose_text(args))
-    except OSError as e:
+        send(args.to, _compose_text(args))
+    except IntercomError as e:
         print(f'уведомление не отправлено: {e}', file=sys.stderr)
-        return 1
-    if reply.get('type') != 'delivered':
-        print(f'уведомление не доставлено: {reply}', file=sys.stderr)
         return 1
     return 0
 
@@ -76,10 +63,10 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _compose_text(args: argparse.Namespace) -> str:
-    """Текст сообщения: где, с каким исходом и что именно завершилось."""
+    """Текст сообщения: исход, команда, урезанный вывод и хвост."""
     outcome = 'успешно' if args.code == 0 else f'с кодом возврата {args.code}'
     duration = (
-        f' за {_format_duration(args.elapsed)}'
+        f' за {format_duration(args.elapsed)}'
         if args.elapsed is not None
         else ''
     )
@@ -87,89 +74,31 @@ def _compose_text(args: argparse.Namespace) -> str:
     if args.command:
         lines += ['', f'`{args.command}`']
     if args.dump:
-        lines += ['', f'Вывод сохранён: `{args.dump}`']
+        lines += _output_lines(args.dump)
     return '\n'.join(lines)
 
 
-def _format_duration(seconds: int) -> str:
-    if seconds < 60:
-        return f'{seconds} с'
-    minutes, rest = divmod(seconds, 60)
-    if minutes < 60:
-        return f'{minutes} мин {rest} с'
-    hours, minutes = divmod(minutes, 60)
-    return f'{hours} ч {minutes} мин'
+def _output_lines(dump: str) -> list[str]:
+    """Блок вывода и хвост; дамп не читается — честная строка вместо них."""
+    text = _read_dump(dump)
+    if text is None:
+        return ['', f'Вывод не удалось прочитать: `{dump}`']
+    truncation = truncate(text)
+    lines = ['', truncation.block] if truncation.block else []
+    lines += ['', f'Вывод сохранён: `{dump}`']
+    tail = hint(truncation, dump)
+    if tail:
+        lines.append(tail)
+    return lines
 
 
-def _send(target: str, text: str) -> dict:
-    """Регистрируется в брокере, отправляет сообщение, возвращает его ответ."""
-    now = int(time.time() * 1000)
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(CONNECT_TIMEOUT)
-        sock.connect(SOCKET_PATH)
-        _write_frame(
-            sock,
-            {
-                'type': 'register',
-                'session': {
-                    'name': 'tmux-pane',
-                    'cwd': os.getcwd(),
-                    'model': 'none',
-                    'pid': os.getpid(),
-                    'startedAt': now,
-                    'lastActivity': now,
-                },
-            },
-        )
-        registered = _read_frame(sock)
-        if not registered or registered.get('type') != 'registered':
-            raise OSError(f'брокер не подтвердил регистрацию: {registered}')
-        _write_frame(
-            sock,
-            {
-                'type': 'send',
-                'to': target,
-                'message': {
-                    'id': str(uuid.uuid4()),
-                    'timestamp': now,
-                    'content': {'text': text},
-                },
-            },
-        )
-        reply = _read_frame(sock)
-        if reply is None:
-            raise OSError('брокер не ответил на отправку')
-        return reply
-
-
-def _write_frame(sock: socket.socket, payload: dict) -> None:
-    body = json.dumps(payload).encode()
-    sock.sendall(struct.pack('>I', len(body)) + body)
-
-
-def _read_frame(sock: socket.socket) -> dict | None:
-    sock.settimeout(REPLY_TIMEOUT)
-    header = _recv_exactly(sock, 4)
-    if header is None:
+def _read_dump(path: str) -> str | None:
+    """Содержимое дампа или None, если файл не читается."""
+    try:
+        with open(path, encoding='utf-8', errors='replace') as handle:
+            return handle.read()
+    except OSError:
         return None
-    (length,) = struct.unpack('>I', header)
-    body = _recv_exactly(sock, length)
-    if body is None:
-        return None
-    return json.loads(body)
-
-
-def _recv_exactly(sock: socket.socket, count: int) -> bytes | None:
-    buf = b''
-    while len(buf) < count:
-        try:
-            chunk = sock.recv(count - len(buf))
-        except TimeoutError:
-            return None
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
 
 
 if __name__ == '__main__':
